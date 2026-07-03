@@ -1,0 +1,12 @@
+# soda/configuration.yml
+#
+# Soda Core has no first-class SQLite driver, and this exercise's
+# persistence layer is SQLite — so scans point at a DuckDB file that
+# pipeline.py's _mirror_tables_to_duckdb() refreshes immediately before
+# every scan. See pipeline.py section 3 for why this bridge exists and
+# what it would look like against a real warehouse instead.
+
+data_source oaf_warehouse:
+  type: duckdb
+  connection:
+    path: "data/soda_mirror.duckdb"

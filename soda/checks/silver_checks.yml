@@ -1,0 +1,62 @@
+# soda/checks/silver_checks.yml
+#
+# Data contract for the Silver layer. Runs after Bronze/Silver ingestion,
+# before the allocator ever reads silver_grants or silver_expenses. A
+# failing check here halts the pipeline — this is the circuit breaker,
+# not a passive dashboard.
+#
+# Split by severity:
+#   fail  -> corrupts the allocation if it proceeds; hard stop.
+#   warn  -> worth Finance's attention, not worth halting a run for.
+
+checks for silver_grants:
+
+  # --- Structural: is the dimension even usable ---
+  - row_count > 0:
+      name: Grants dimension must not be empty
+
+  - missing_count(GrantCode) = 0:
+      name: Every grant must have a code
+  - duplicate_count(GrantCode) = 0:
+      name: GrantCode must be unique (dimension key)
+
+  - missing_count(TotalAmount) = 0:
+      name: TotalAmount must never be null
+  - invalid_count(TotalAmount) = 0:
+      valid min: 0.01
+      name: TotalAmount must be positive
+
+  - missing_count(StartDate) = 0
+  - missing_count(EndDate) = 0
+
+  # --- Cross-column: can't be expressed as a single-column check ---
+  - failed rows:
+      name: Grant EndDate must not precede StartDate
+      fail query: |
+        SELECT GrantCode
+        FROM silver_grants
+        WHERE EndDate < StartDate
+
+
+checks for silver_expenses:
+
+  - row_count > 0:
+      name: Expenses fact table must not be empty
+
+  - missing_count(TransactionId) = 0
+  - duplicate_count(TransactionId) = 0:
+      name: TransactionId must be unique — dedup failure would double-count spend
+
+  - missing_count(TransactionDate) = 0
+  - missing_count(Amount) = 0
+  - invalid_count(Amount) = 0:
+      valid min: 0.01
+      name: Expense Amount must be positive (refunds/credits go through a
+            separate reversal path, not the standard drawdown)
+
+  # Freshness deliberately omitted: this dataset is a fixed historical
+  # fixture, not a live daily feed, so "is the latest transaction date
+  # recent" isn't a meaningful question here — it would always fail
+  # against static data regardless of data quality. Against a genuinely
+  # live source this earns its place as a warn-level check (not a hard
+  # fail), correctly split via SodaCL's warn/fail threshold syntax.

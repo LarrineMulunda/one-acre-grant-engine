@@ -1,0 +1,36 @@
+# soda/checks/gold_checks.yml
+#
+# Runs AFTER load_gold_period, as a post-write canary — not a pre-allocation
+# gate like silver_checks.yml. If this ever fails, it means the atomic swap
+# itself produced an inconsistency (should be structurally impossible given
+# core_allocator only draws from grants present in grants_df), so failure
+# here is a signal to investigate the swap/period-scoping logic itself,
+# not a routine data-quality issue.
+
+checks for gold_allocations:
+
+  - failed rows:
+      name: Allocation references a GrantCode not present in silver_grants
+      fail query: |
+        SELECT a.GrantCode, a.TransactionId
+        FROM gold_allocations a
+        LEFT JOIN silver_grants g ON a.GrantCode = g.GrantCode
+        WHERE g.GrantCode IS NULL
+
+  - failed rows:
+      name: Allocation row references a PeriodId with no accounting_periods entry
+      fail query: |
+        SELECT a.PeriodId, a.TransactionId
+        FROM gold_allocations a
+        LEFT JOIN accounting_periods p ON a.PeriodId = p.PeriodId
+        WHERE p.PeriodId IS NULL
+
+
+checks for gold_grant_balances:
+
+  - failed rows:
+      name: Negative remaining balance — should be structurally impossible
+      fail query: |
+        SELECT GrantCode, PeriodId, RemainingAmount
+        FROM gold_grant_balances
+        WHERE RemainingAmount < -0.01
