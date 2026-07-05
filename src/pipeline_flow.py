@@ -1015,4 +1015,4 @@ def end_to_end_pipeline(period_id: str = "2027"):
 
 
 if __name__ == "__main__":
-    end_to_end_pipeline(period_id="2021_2026")
+    end_to_end_pipeline(period_id="2022_2025")
