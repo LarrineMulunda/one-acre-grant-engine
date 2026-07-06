@@ -1,8 +1,6 @@
 """
 pipeline.py  —  End-to-End Grant Allocation Pipeline (Production)
 =================================================================
-Author  : Larrine Mulunda
-Context : One Acre Fund · Data Engineering · Final Round
 
 Layers
 ------
@@ -15,49 +13,46 @@ Layers
              accounting_periods (OPEN/CLOSED per PeriodId — governs whether
              Gold can be atomically swapped for that period).
 
-Watermarks vs. periods — two different mechanisms, don't conflate them
+Watermarks vs. periods — two different mechanisms
 ------------------------------------------------------------------------
 etl_watermarks answers "how far into the raw source file have I already
 copied into Bronze/Silver" — a Bronze/Silver ingestion optimization,
 unrelated to allocation correctness.
 accounting_periods answers "is this PeriodId still allowed to be
 recomputed" — a Gold-layer governance gate. The allocator's window is
-always PERIOD_DEFINITIONS[period_id], never "since the watermark."
+always PERIOD_DEFINITIONS[period_id]
 """
 
 from __future__ import annotations
 
 import logging
+import os
 import smtplib
 import traceback
 from datetime import date, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from typing import Optional
-
 import pandas as pd
 from openai import OpenAI
 from prefect import flow, get_run_logger, task
+from prefect.tasks import exponential_backoff
 from prefect.blocks.system import Secret
 from soda.scan import Scan
 from sqlalchemy import create_engine, text, inspect
 from sqlalchemy.pool import NullPool
 
 from src.core_allocator import allocate, PERIOD_DEFINITIONS, build_closing_balances
+from dotenv import load_dotenv
+load_dotenv() 
+LOOKBACK_DAYS = 2 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Engine / constants
 # ─────────────────────────────────────────────────────────────────────────────
 
-import os
-
 # In a deployed environment (Prefect Cloud / a persistent Prefect server),
-# the connection string comes from a Secret block, same as before. Locally,
-# requiring a live Prefect server just to resolve a dev SQLite path is
-# unnecessary fragility — one more process to remember to keep running,
-# and its own separate point of failure (see: WinError 10061 the moment
-# the local server isn't up). Falling back to an env var (or a hardcoded
-# local default) keeps local runs self-contained.
+
 try:
     DB_URI = Secret.load("warehouse-uri").get()
 except Exception:
@@ -68,13 +63,7 @@ except Exception:
         f"ever fire in local dev, never against a deployed flow."
     )
 
-# NullPool: don't hold a pooled connection open between tasks — each Prefect
-# task opens and closes its own connection, so a lingering pooled connection
-# from an earlier task is a real way to self-collide on SQLite's file lock,
-# separate from any external process (OneDrive, a stray python.exe, etc.).
-# connect_args timeout + PRAGMA busy_timeout: wait for a lock instead of
-# failing after SQLite's default 5s — that default is exactly why failures
-# were landing ~5-6 seconds after each task started.
+
 engine = create_engine(
     DB_URI,
     pool_pre_ping=True,
@@ -93,20 +82,12 @@ GRANT_SCHEMA    = ["GrantCode", "GrantName", "Priority", "StartDate", "EndDate",
                    "TotalAmount"] + GRANT_RESTRICTIONS
 EXPENSE_SCHEMA  = ["TransactionId", "TransactionDate", "Amount"] + GRANT_RESTRICTIONS
 
-RETRY_POLICY = dict(retries=3, retry_delay_seconds=30)
+RETRY_POLICY = dict(retries=3, retry_delay_seconds=exponential_backoff(backoff_factor=30))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Notifications — success/failure email, wired via Prefect flow-state hooks
 # ─────────────────────────────────────────────────────────────────────────────
-#
-# Same pattern as DB_URI above: Secret blocks first (the real production
-# path), env vars as a local-dev fallback. Credentials for a Gmail sender
-# specifically need an App Password, not the account password — Gmail
-# rejects plain SMTP auth for accounts with 2FA enabled, which is the
-# default. Generate one at https://myaccount.google.com/apppasswords once
-# 2-Step Verification is on, and use that 16-character value as
-# SMTP_APP_PASSWORD, not the actual Google account password.
 
 NOTIFY_TO = "mulslarry100@gmail.com"
 SMTP_HOST = "smtp.gmail.com"
@@ -163,18 +144,8 @@ def _get_ai_troubleshooting(error_message: str, traceback_text: str) -> str:
     second failure stacked on top of the pipeline's original one. Always
     returns a string; never raises.
 
-    This is Use Case 3 from the Part 2 memo (Agentic DataOps &
-    Observability) actually implemented, not just proposed: the agent
-    drafts a remediation suggestion, a human engineer still has to read it,
-    verify it against the real logs, and act — it never touches the
-    pipeline or infrastructure itself.
-
-    Model: gpt-5.4-mini — OpenAI's current cost-optimized tier for coding
-    and professional-work tasks (verified against OpenAI's own model page
-    at write time, not assumed from training data, since pricing/lineups
-    shift). Swap for gpt-4.1-nano if this task's diagnostic quality is
-    sufficient at an even lower cost — worth checking against a few real
-    failures before deciding.
+    Model: gpt-5.4-mini - OpenAI's current cost-optimized tier for coding
+    and professional-work tasks
     """
     try:
         api_key = Secret.load("openai-api-key").get()
@@ -182,7 +153,7 @@ def _get_ai_troubleshooting(error_message: str, traceback_text: str) -> str:
         api_key = os.environ.get("OPENAI_API_KEY")
 
     if not api_key:
-        return "(AI troubleshooting unavailable — no OPENAI_API_KEY configured.)"
+        return "(AI troubleshooting unavailable - no OPENAI_API_KEY configured.)"
 
     try:
         client = OpenAI(api_key=api_key)
@@ -226,10 +197,7 @@ def _notify_success(flow_, flow_run, state) -> None:
 def _notify_failure(flow_, flow_run, state) -> None:
     """
     state.message already contains the real exception text (e.g. "Flow run
-    encountered an exception: ValueError: Reconciliation failed...") — not
-    a generic placeholder, confirmed directly. state.result() additionally
-    gives the raw exception object, which yields a full traceback showing
-    exactly which task/line failed, not just the top-level message.
+    encountered an exception: ValueError: Reconciliation failed...") 
     """
     result = state.result(raise_on_failure=False)
     if isinstance(result, BaseException):
@@ -265,17 +233,6 @@ def _notify_failure(flow_, flow_run, state) -> None:
 def _clean_restriction_column(series: pd.Series) -> pd.Series:
     """
     Stringify a restriction column with numeric-formatting normalization.
-
-    Root-cause fix: grants and expenses are independent source files, and
-    pandas infers numeric column dtype per-file — e.g. Account with no NaNs
-    in the expenses file reads as int64 ("10002"), while the same column
-    with any NaN in the grants file reads as float64 ("10002.0"). A plain
-    astype(str) then produces two different strings for the same value,
-    which silently fails the equality check in core_allocator._eligibility
-    — not an exception, not a validation failure, just a grant that never
-    matches for that specific value. Stripping a trailing ".0" after
-    stringifying makes both sides converge on the same text regardless of
-    which side's source file happened to trigger the float upcast.
     """
     s = series.astype(str).str.strip()
     return s.str.replace(r"\.0$", "", regex=True)
@@ -462,7 +419,8 @@ def process_expenses_incremental(watermark: str) -> str:
     _validate_schema(raw, EXPENSE_SCHEMA, "raw_expenses")
 
     raw["TransactionDate"] = pd.to_datetime(raw["TransactionDate"])
-    incremental = raw[raw["TransactionDate"] > pd.Timestamp(watermark)].copy()
+    window_start = pd.Timestamp(watermark) - pd.Timedelta(days=LOOKBACK_DAYS)
+    incremental = raw[raw["TransactionDate"] > window_start].copy()
 
     if incremental.empty:
         logger.info("No new expenses since watermark.  Nothing to do.")
@@ -488,32 +446,83 @@ def process_expenses_incremental(watermark: str) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 # 3. Data Quality — Soda Core gate
 # ─────────────────────────────────────────────────────────────────────────────
-#
-# Soda Core has no first-class SQLite driver. Since this exercise's
-# persistence layer IS SQLite (not a local stand-in for something else),
-# the bridge is explicit rather than hidden: mirror the exact tables each
-# scan needs into a DuckDB file immediately beforehand, then point Soda at
-# that. DuckDB reads pandas DataFrames natively and writes a real on-disk
-# file Soda can connect to like any other data source — no separate
-# warehouse, no network dependency, and the mirrored tables are a faithful
-# byte-for-byte copy of what's actually in SQLite at scan time.
-#
-# In a Snowflake-backed deployment this whole mirror step disappears —
-# soda-core-snowflake connects directly, same configuration.yml pattern,
-# no bridge needed. It exists here specifically because the underlying
-# store is SQLite.
+
+# Soda Core has no first-class SQLite driver. In the exercise we are using a mirrored duck db
+#In snowflake , there will be no need of mirroring
 
 import duckdb
-
 SODA_MIRROR_PATH = "data/soda_mirror.duckdb"
 
 # Columns that need to be real datetimes in the mirror, not raw strings —
 # required for Soda's freshness() check specifically; every other check
-# works fine on strings, freshness does not.
 _DATE_COLUMNS_BY_TABLE = {
     "silver_grants":   ["StartDate", "EndDate"],
     "silver_expenses": ["TransactionDate"],
 }
+
+# Known schema per Gold table, mirroring core_allocator.py's _ALLOC_COLS /
+# _UNALLOC_COLS / _BALANCE_COLS — needed when a table doesn't exist yet
+# (load_gold_period only creates a table when its DataFrame has rows, so a
+# period allocating nothing at all never creates gold_allocations). DuckDB
+# cannot build a table from a truly columnless DataFrame ("Need a
+# DataFrame with at least one column", confirmed directly) — an empty
+# frame needs real columns defined, just zero rows.
+_GOLD_TABLE_COLUMNS = {
+    "gold_allocations": [
+        "RunId", "PeriodId", "AllocationOrder", "TransactionId", "TransactionDate",
+        "GrantCode", "AllocatedAmount", "GrantPriority", "GrantEndDate",
+    ],
+    "gold_unallocated": [
+        "RunId", "PeriodId", "TransactionId", "TransactionDate",
+        "BusinessUnit", "Country", "Account", "ProjectName", "DepartmentName",
+        "OriginalAmount", "UnallocatedAmount", "Reason",
+    ],
+    "gold_grant_balances": [
+        "PeriodId", "GrantCode", "GrantName", "Priority", "EndDate",
+        "OpeningAmount", "TotalAmount", "RemainingAmount",
+        "ConsumedAmount", "ConsumedPct", "RunId",
+    ],
+}
+
+
+def _to_csv_with_retry(df: pd.DataFrame, filepath: str, max_retries: int = 3, delay_seconds: float = 2.0) -> None:
+    """
+    Writes a CSV with bounded retries on PermissionError specifically — a
+    real, recurring failure mode on Windows when a sync client (OneDrive)
+    or another program transiently locks a file the instant it's created
+    or rewritten. 
+    """
+    import time
+    for attempt in range(1, max_retries + 1):
+        try:
+            df.to_csv(filepath, index=False)
+            return
+        except PermissionError as e:
+            if attempt == max_retries:
+                get_run_logger().error(
+                    f"Failed to write {filepath} after {max_retries} attempts "
+                    f"— still locked: {e}. Check whether OneDrive is syncing "
+                    f"this folder, or whether the file is open in another "
+                    f"program, then re-run."
+                )
+                raise
+            get_run_logger().warning(
+                f"PermissionError writing {filepath} (attempt {attempt}/{max_retries}) "
+                f"— likely a transient file lock (OneDrive sync is the usual "
+                f"cause in this project). Retrying in {delay_seconds}s."
+            )
+            time.sleep(delay_seconds)
+
+
+def _empty_frame_for(table: str) -> pd.DataFrame:
+    """
+    A zero-row DataFrame with the correct columns for a known Gold table,
+    or a plain columnless empty frame for anything else (Silver tables
+    always exist by the time they're mirrored, so this path is really only
+    ever exercised for the three Gold tables above).
+    """
+    columns = _GOLD_TABLE_COLUMNS.get(table)
+    return pd.DataFrame(columns=columns) if columns else pd.DataFrame()
 
 
 def _mirror_tables_to_duckdb(table_names: list[str]) -> None:
@@ -522,18 +531,23 @@ def _mirror_tables_to_duckdb(table_names: list[str]) -> None:
     file Soda Core can scan. Runs immediately before each scan so the
     mirror reflects the current state, not a stale snapshot.
 
-    dtype_backend='numpy_nullable' is required, not optional: pandas 3.x
-    defaults string columns to its new pyarrow-backed "str" dtype, which
-    DuckDB 1.x's pandas scanner does not recognize (raises
-    NotImplementedException: Data type 'str' not recognized). Forcing
-    numpy_nullable keeps columns as numpy/nullable dtypes DuckDB can read.
     """
+    inspector = inspect(engine)
+    existing_tables = set(inspector.get_table_names())
+
     dcon = duckdb.connect(SODA_MIRROR_PATH)
     for table in table_names:
-        df = pd.read_sql(f"SELECT * FROM {table}", engine, dtype_backend="numpy_nullable")
-        for col in _DATE_COLUMNS_BY_TABLE.get(table, []):
-            if col in df.columns:
-                df[col] = pd.to_datetime(df[col])
+        if table not in existing_tables:
+            get_run_logger().warning(
+                f"'{table}' does not exist yet in the source database — "
+                f"mirroring an empty frame instead of failing the scan."
+            )
+            df = _empty_frame_for(table)
+        else:
+            df = pd.read_sql(f"SELECT * FROM {table}", engine, dtype_backend="numpy_nullable")
+            for col in _DATE_COLUMNS_BY_TABLE.get(table, []):
+                if col in df.columns:
+                    df[col] = pd.to_datetime(df[col])
         dcon.execute(f"CREATE OR REPLACE TABLE {table} AS SELECT * FROM df")
     dcon.close()
 
@@ -600,9 +614,6 @@ def run_gold_quality_canary(period_id: str) -> None:
             f"period {period_id} — this should be impossible:\n"
             f"{scan.get_checks_fail_text()}"
         )
-        # Deliberately not raising: the write already committed, and halting
-        # the flow here wouldn't undo it. This should page on-call directly
-        # (wire to your alerting integration) rather than fail the run.
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -805,18 +816,66 @@ def load_gold_period(results: dict, period_id: str) -> None:
     logger.info(f"Gold[{period_id}] updated — {n_alloc:,} allocation rows  ·  {n_unalloc:,} unallocated rows")
 
 
+def _snapshot_to_gold_table(period_id: str, tag: str) -> None:
+    """
+    Writes a permanent, queryable copy of this period's three Gold tables
+    into dedicated *_snapshot tables in the same database — the Gold-layer
+    equivalent of close_period()'s CSV exports, but queryable via SQL
+    instead of requiring a file to be opened.
+
+    One snapshot table per source table (gold_allocations_snapshot, etc.),
+    not one table per period — every snapshot ever taken, across every
+    period and every tag, lands in the same table, distinguished by
+    PeriodId + SnapshotTag + SnapshotAt. 
+
+    """
+    existing_tables = set(inspect(engine).get_table_names())
+    snapshot_ts = pd.Timestamp.now("UTC")
+
+    for source_table in ["gold_allocations", "gold_unallocated", "gold_grant_balances"]:
+        snapshot_table = f"{source_table}_snapshot"
+
+        if source_table in existing_tables:
+            df = pd.read_sql(
+                text(f"SELECT * FROM {source_table} WHERE PeriodId = :p"),
+                engine, params={"p": period_id},
+            )
+        else:
+            df = _empty_frame_for(source_table)
+
+        df = df.copy()
+        df["SnapshotTag"] = tag
+        df["SnapshotAt"] = snapshot_ts
+
+        with engine.begin() as conn:
+            df.to_sql(snapshot_table, conn, if_exists="append", index=False)
+
+    get_run_logger().info(
+        f"Gold-layer snapshot written for period '{period_id}', tag='{tag}' "
+        f"— query gold_allocations_snapshot / gold_unallocated_snapshot / "
+        f"gold_grant_balances_snapshot WHERE PeriodId='{period_id}' to see it."
+    )
+
+
 @task(name="Close Period", **RETRY_POLICY)
 def close_period(period_id: str, closed_by: str) -> None:
     """
     Deliberate, Finance-triggered operation — not part of the scheduled
-    flow. Flips status to CLOSED only after the atomic swap for this
-    period's final recompute has already succeeded, and exports the three
-    certified files.
+    flow. Reruns the period's allocation one final time (guaranteeing the
+    closing snapshot reflects the true current state, not whatever was
+    last sitting in Gold from an earlier scheduled run), flips status to
+    CLOSED, exports the three certified files, then sends a closure
+    notification. Each step only proceeds if the one before it succeeded.
     """
     logger = get_run_logger()
     status = get_period_status.fn(period_id)
     if status == "CLOSED":
         raise RuntimeError(f"PeriodId '{period_id}' is already CLOSED.")
+
+    # Final recompute — guarantees the snapshot about to be locked in
+    opening = get_opening_balances.fn(period_id)
+    result = run_period_allocation.fn(period_id, opening)
+    load_gold_period.fn(result, period_id)
 
     with engine.begin() as conn:
         conn.execute(text("""
@@ -825,15 +884,35 @@ def close_period(period_id: str, closed_by: str) -> None:
             WHERE PeriodId = :p
         """), {"who": closed_by, "p": period_id})
 
+    exported_files = []
+    existing_tables = set(inspect(engine).get_table_names())
     for table, filename in [
         ("gold_allocations", f"exports/allocation_{period_id}.csv"),
         ("gold_unallocated", f"exports/unallocated_{period_id}.csv"),
         ("gold_grant_balances", f"exports/grant_balance_{period_id}.csv"),
     ]:
-        df = pd.read_sql(text(f"SELECT * FROM {table} WHERE PeriodId = :p"), engine, params={"p": period_id})
-        df.to_csv(filename, index=False)
+        if table not in existing_tables:
+            logger.warning(f"'{table}' does not exist yet — exporting an empty file for {filename}.")
+            _to_csv_with_retry(pd.DataFrame(), filename)
+        else:
+            df = pd.read_sql(text(f"SELECT * FROM {table} WHERE PeriodId = :p"), engine, params={"p": period_id})
+            _to_csv_with_retry(df, filename)
+        exported_files.append(filename)
 
     logger.info(f"Period {period_id} CLOSED by {closed_by}. Exports written.")
+    _snapshot_to_gold_table(period_id, tag="CLOSED")
+
+    total_allocated = result.get("allocations", pd.DataFrame()).get("AllocatedAmount", pd.Series(dtype=float)).sum()
+    total_unallocated = result.get("unallocated", pd.DataFrame()).get("UnallocatedAmount", pd.Series(dtype=float)).sum()
+    _send_notification(
+        subject=f"[CLOSED] Accounting period {period_id} closed by {closed_by}",
+        body=(
+            f"Period '{period_id}' was closed by {closed_by}.\n\n"
+            f"Final allocated: {total_allocated:,.2f}\n"
+            f"Final unallocated: {total_unallocated:,.2f}\n\n"
+            f"Exported files:\n" + "\n".join(f"  - {f}" for f in exported_files)
+        ),
+    )
 
 
 def _snapshot_period_state(period_id: str, tag: str) -> None:
@@ -846,12 +925,20 @@ def _snapshot_period_state(period_id: str, tag: str) -> None:
     export.
     """
     os.makedirs("exports/snapshots", exist_ok=True)
+    existing_tables = set(inspect(engine).get_table_names())
     for table in ["gold_allocations", "gold_unallocated", "gold_grant_balances"]:
-        df = pd.read_sql(
-            text(f"SELECT * FROM {table} WHERE PeriodId = :p"),
-            engine, params={"p": period_id},
-        )
-        df.to_csv(f"exports/snapshots/{tag}_{table}_{period_id}.csv", index=False)
+        if table not in existing_tables:
+            get_run_logger().warning(
+                f"'{table}' does not exist yet — writing an empty snapshot "
+                f"for {tag}_{table}_{period_id}.csv."
+            )
+            df = _empty_frame_for(table)
+        else:
+            df = pd.read_sql(
+                text(f"SELECT * FROM {table} WHERE PeriodId = :p"),
+                engine, params={"p": period_id},
+            )
+        _to_csv_with_retry(df, f"exports/snapshots/{tag}_{table}_{period_id}.csv")
 
 
 def reopen_and_cascade(period_id: str, reason: str, corrected_by: str) -> None:
@@ -906,18 +993,16 @@ def reopen_and_cascade(period_id: str, reason: str, corrected_by: str) -> None:
     for p in affected_period_ids:
         _snapshot_period_state(p, tag="before")
 
-    # Reopen and recompute the corrected period itself.
+    # Reopen the corrected period — close_period.fn() now recomputes and
+    # swaps internally before reclosing, so no manual recompute needed here.
     with engine.begin() as conn:
         conn.execute(
             text("UPDATE accounting_periods SET Status='OPEN', ClosedAt=NULL, ClosedBy=NULL WHERE PeriodId=:p"),
             {"p": period_id},
         )
-    opening = get_opening_balances.fn(period_id)
-    result = run_period_allocation.fn(period_id, opening)
-    load_gold_period.fn(result, period_id)
     close_period.fn(period_id, closed_by=corrected_by)
-
-    # Cascade forward: recompute every later period, reopening first if needed.
+    touched_period_ids = [period_id]
+    stopped_early_at = None
     for p in affected_period_ids[1:]:
         p_status = get_period_status.fn(p)
         was_closed = p_status == "CLOSED"
@@ -928,24 +1013,44 @@ def reopen_and_cascade(period_id: str, reason: str, corrected_by: str) -> None:
                     text("UPDATE accounting_periods SET Status='OPEN', ClosedAt=NULL, ClosedBy=NULL WHERE PeriodId=:p"),
                     {"p": p},
                 )
-
-        opening_p = get_opening_balances.fn(p)
-        result_p = run_period_allocation.fn(p, opening_p)
-        load_gold_period.fn(result_p, p)
-
-        if was_closed:
             close_period.fn(p, closed_by=corrected_by)
             logger.info(f"Cascaded correction through '{p}' (was CLOSED — reopened, recomputed, reclosed).")
+            touched_period_ids.append(p)
         else:
+            opening_p = get_opening_balances.fn(p)
+            result_p = run_period_allocation.fn(p, opening_p)
+            load_gold_period.fn(result_p, p)
             logger.info(f"Cascaded correction through '{p}' (was OPEN — recomputed only).")
+            touched_period_ids.append(p)
+            stopped_early_at = p
+            remaining = affected_period_ids[affected_period_ids.index(p) + 1:]
+            if remaining:
+                logger.warning(
+                    f"Cascade stopping at '{p}' — it was already OPEN, and "
+                    f"the periods after it ({remaining}) cannot be seeded "
+                    f"until '{p}' is itself closed. Run close_period_cli.py "
+                    f"for '{p}' first if you want the correction to reach "
+                    f"further, then re-run the pipeline for the periods "
+                    f"after it in order."
+                )
+            break
 
-    for p in affected_period_ids:
+    for p in touched_period_ids:
         _snapshot_period_state(p, tag="after")
 
-    logger.info(
-        f"Cascade complete. BEFORE/AFTER snapshots for {affected_period_ids} "
-        f"written to exports/snapshots/ — diff them to see exactly what changed."
-    )
+    if stopped_early_at:
+        logger.info(
+            f"Cascade complete (stopped early at '{stopped_early_at}'). "
+            f"Periods actually touched: {touched_period_ids}. "
+            f"BEFORE/AFTER snapshots written to exports/snapshots/ for "
+            f"these periods only — diff them to see exactly what changed."
+        )
+    else:
+        logger.info(
+            f"Cascade complete. Periods touched: {touched_period_ids}. "
+            f"BEFORE/AFTER snapshots for {touched_period_ids} written to "
+            f"exports/snapshots/ — diff them to see exactly what changed."
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1015,4 +1120,4 @@ def end_to_end_pipeline(period_id: str = "2027"):
 
 
 if __name__ == "__main__":
-    end_to_end_pipeline(period_id="2022_2025")
+    end_to_end_pipeline(period_id="2026_H1")

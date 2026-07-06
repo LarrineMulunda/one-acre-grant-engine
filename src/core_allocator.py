@@ -1,12 +1,9 @@
 """
 core_allocator.py  —  Grant Allocation Engine (Production)
 ===========================================================
-Author  : Larrine Mulunda
-Context : One Acre Fund · Data Engineering · Final Round
-
 A pure, stateless function of (grants_df, expenses_df, period_id, tie_break,
 opening_balances) that allocates every expense dollar to one or more grants
-according to OAF's legal funding rules and returns three audit-ready
+according to grants funding rules and returns three audit-ready
 DataFrames plus a lineage RunId.
 
 Design invariants
@@ -25,36 +22,18 @@ Design invariants
                        module has no notion of "open" or "closed," only of
                        "which balance did I start from."
 
-A note on balance comparison
-------------------------------
-Eligibility checks a grant's remaining balance with a plain `> 0`, matching
-the notebook's Exercise 1 logic exactly. An earlier production revision
-compared against a 0.005 epsilon to guard against float64 residue (e.g.
-0.10 - 0.03 - 0.03 - 0.03 - 0.01 leaving 3.47e-18 instead of exactly 0).
-That guard was reverted: it excluded genuinely real small balances
-(a grant sitting at $0.003, for instance) as well as float noise, and
-because a depleted grant never regains budget, misclassifying one real
-small balance as exhausted this early in a period cascades into every
-later transaction that would have matched it. If float-residue ghost
-balances become a real, observed problem, the correct fix is rounding to
-the cent before comparing (`np.round(balances, 2) > 0`), not raising the
-threshold above real money.
+
 
 A note on zero-division handling
 -----------------------------------
 ConsumedPct in the balance snapshot is computed with a guard against
-TotalAmount == 0 (np.where(total > 0, consumed / total, 0.0)), independent
-of the balance-comparison note above — this protects _build_balance_frame
-when the engine is called directly in tests or ad-hoc scripts, not only
-behind the pipeline's own upstream validation.
+TotalAmount == 0 (np.where(total > 0, consumed / total, 0.0))
 
 A note on null-restriction matching
 -------------------------------------
 When an expense has a NaN restriction value (e.g. no Country recorded), it
 matches only wildcard grants — those with a null restriction on that column.
-A grant's own non-null restriction never matches a NaN expense value (IEEE
-754: NaN ≠ NaN). This is intentional: a transaction with unknown metadata
-cannot claim a restricted grant.
+
 """
 
 from __future__ import annotations
@@ -71,13 +50,15 @@ import pandas as pd
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Every transaction date must fall inside exactly one of these ranges.
-# "2021_2025" is the initial backfill period — it has no prior closed period,
-# so its opening balance is always grants_df.TotalAmount (see allocate()).
-# "2026" is the first period that seeds from a carried-forward closing
-# balance rather than the grant's full original amount.
+# "2021_2024" is the initial backfill period — it has no prior closed period,
+
 PERIOD_DEFINITIONS: dict[str, tuple[date, date]] = {
-    "2021_2025": (date(2021, 1, 1), date(2025, 12, 31)),
-    "2026":      (date(2026, 1, 1), date(2026, 12, 31)),
+    "2021_2024": (date(2021, 1, 1), date(2024, 12, 31)),
+    "2025_H1": (date(2025, 1, 1), date(2025, 6, 30)),
+    "2025_H2": (date(2025, 7, 1), date(2025, 12, 31)),
+    "2026_H1":      (date(2026, 1, 1), date(2026, 6, 30)),
+    "2026_H2":      (date(2026, 7, 1), date(2026, 12, 31))
+    
 }
 
 
@@ -233,8 +214,8 @@ def _resolve_opening_balances(
                 f"{'...' if len(bad_codes) > 5 else ''}"
             )
 
-        # Genuinely new grants: no prior period could have given them a
-        # balance, so they start fresh at their own TotalAmount.
+        # Genuinely new grants: start fresh at their own TotalAmount.
+        
         opening = opening.where(~genuinely_new, grants_df["TotalAmount"])
 
     return opening.to_numpy(dtype="float64")
@@ -400,7 +381,7 @@ def allocate(
     opening_balances: dict[str, float] | None = None,
 ) -> dict:
     """
-    Allocate every expense dollar to one or more grants per OAF business rules,
+    Allocate every expense dollar to one or more grants per grant business rules,
     scoped to a single accounting period.
 
     Parameters
@@ -435,7 +416,7 @@ def allocate(
       this function does not filter by date itself, it trusts the caller's
       windowing (see pipeline._load_period_transactions()).
     - Reconciliation (Σ allocated + Σ unallocated == Σ expenses) is asserted
-      AFTER calling allocate(). See pipeline._assert_reconciliation().
+      AFTER calling allocate().
     - Whether this period's output is written via atomic swap (OPEN) or
       rejected/routed to a reversal path (CLOSED) is decided by pipeline.py,
       not by this module.
