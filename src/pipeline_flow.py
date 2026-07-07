@@ -565,6 +565,19 @@ def _run_soda_scan(checks_yaml_path: str, scan_name: str) -> Scan:
     scan.execute()
     return scan
 
+def _mirror_raw_csv_to_duckdb(csv_path: str, table_name: str) -> None:
+    """
+    Mirrors a raw source CSV into the same DuckDB file used for Soda scans,
+    so a Silver-layer row-count reconciliation check can compare against it
+    directly via SodaCL's `row_count same as <dataset>` — verified real and
+    working against a live scan before being relied on here.
+    """
+    df = pd.read_csv(csv_path, dtype_backend="numpy_nullable")
+    dcon = duckdb.connect(SODA_MIRROR_PATH)
+    dcon.execute(f"CREATE OR REPLACE TABLE {table_name} AS SELECT * FROM df")
+    dcon.close()
+    get_run_logger().info(f"Mirrored {len(df):,} rows from {csv_path} into {table_name} for Soda comparison.")
+
 
 @task(name="Silver Data Quality Gate (Soda)", **RETRY_POLICY)
 def run_silver_quality_gate() -> None:
@@ -577,6 +590,7 @@ def run_silver_quality_gate() -> None:
     """
     logger = get_run_logger()
     _mirror_tables_to_duckdb(["silver_grants", "silver_expenses"])
+    _mirror_raw_csv_to_duckdb("data/raw_grants.csv", "raw_grants_source")
     scan = _run_soda_scan("soda/checks/silver_checks.yml", scan_name="silver_gate")
 
     logger.info(scan.get_logs_text())

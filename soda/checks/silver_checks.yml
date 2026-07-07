@@ -15,6 +15,11 @@ checks for silver_grants:
   - row_count > 0:
       name: Grants dimension must not be empty
 
+  # Row-count reconciliation against the raw source — grants has zero
+
+  - row_count same as raw_grants_source:
+      name: Silver grants row count must match raw source exactly
+
   - missing_count(GrantCode) = 0:
       name: Every grant must have a code
   - duplicate_count(GrantCode) = 0:
@@ -37,6 +42,27 @@ checks for silver_grants:
         FROM silver_grants
         WHERE EndDate < StartDate
 
+  # --- Schema drift: catches an upstream rename/drop/type-change before it
+  # silently breaks the allocator, rather than surfacing as a downstream
+
+  - schema:
+      name: Grants schema drift
+      fail:
+        when required column missing: [GrantCode, GrantName, TotalAmount,
+          Priority, StartDate, EndDate, BusinessUnit, Country, Account,
+          ProjectName, DepartmentName]
+
+  # `schema:` above catches a column disappearing or changing type, but
+  - failed rows:
+      name: Unexpected new column in silver_grants
+      fail query: |
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_name = 'silver_grants'
+        AND column_name NOT IN ('GrantCode','GrantName','TotalAmount',
+          'Priority','StartDate','EndDate','BusinessUnit','Country',
+          'Account','ProjectName','DepartmentName')
+
 
 checks for silver_expenses:
 
@@ -54,9 +80,17 @@ checks for silver_expenses:
       name: Expense Amount must be positive (refunds/credits go through a
             separate reversal path, not the standard drawdown)
 
-  # Freshness deliberately omitted: this dataset is a fixed historical
-  # fixture, not a live daily feed, so "is the latest transaction date
-  # recent" isn't a meaningful question here — it would always fail
-  # against static data regardless of data quality. Against a genuinely
-  # live source this earns its place as a warn-level check (not a hard
-  # fail), correctly split via SodaCL's warn/fail threshold syntax.
+  - schema:
+      name: Expenses schema drift
+      fail:
+        when required column missing: [TransactionId, TransactionDate,
+          Amount, BusinessUnit, Country, Account, ProjectName, DepartmentName]
+
+  - failed rows:
+      name: Unexpected new column in silver_expenses
+      fail query: |
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_name = 'silver_expenses'
+        AND column_name NOT IN ('TransactionId','TransactionDate','Amount',
+          'BusinessUnit','Country','Account','ProjectName','DepartmentName')
